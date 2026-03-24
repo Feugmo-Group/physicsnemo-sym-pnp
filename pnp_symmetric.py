@@ -1,0 +1,559 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+import os
+import warnings
+import numpy as np
+from sympy import Symbol, Function, Number, Eq
+from matplotlib import colormaps, use
+from matplotlib import pyplot as plt
+from matplotlib.lines import Line2D
+from typing import Tuple
+from registry import (
+    register_custom_arch_configs,
+    register_custom_loss_configs,
+    Parameters,
+    GridRectangle,
+)
+
+import physicsnemo.sym
+from physicsnemo.sym.hydra import to_absolute_path, instantiate_arch, PhysicsNeMoConfig
+from physicsnemo.sym.solver import Solver
+from physicsnemo.sym.domain import Domain
+from physicsnemo.sym.geometry.primitives_2d import Rectangle
+from physicsnemo.sym.domain.constraint import (
+    PointwiseBoundaryConstraint,
+    PointwiseInteriorConstraint,
+)
+from physicsnemo.sym.domain.validator import PointwiseValidator
+from physicsnemo.sym.key import Key
+from physicsnemo.sym.eq.pde import PDE
+from physicsnemo.sym.utils.io import (
+    csv_to_dict,
+    ValidatorPlotter,
+)
+
+use("Agg")
+
+
+class PoissonNernstPlanck(PDE):
+    """
+    Dimensionless 1D Poisson-Nernst-Planck (PNP) system for two ionic species
+    using the symmetric / antisymmetric transformation
+    Reference:
+    Subramaniam, A., Chen, J., Jang, T., Geise, N. R., Kasse, R. M.,
+    Toney, M. F., & Subramanian, V. R. (2019). Analysis and Simulation
+    of One-Dimensional Transport Models for Lithium Symmetric Cells.
+    Journal of The Electrochemical Society, 166(15), A3806.
+    doi:10.1149/2.0261915jes
+
+    Parameters
+    ==========
+    eps : float, optional
+        Dimensionless Poisson parameter. Defined as
+        sqrt(R * T * eps_s * eps_0 / (z_p ** 2 * F ** 2 * c_0 * L ** 2))
+        Default is 1.
+    xi : float, optional
+        Dimensionless ratio of diffusion coefficients: D_p / D_n. Default is 1.
+
+    Example
+    ========
+    >>> pnp = PoissonNernstPlanck(eps=0.1, xi=0.1)
+    >>> pnp.pprint()
+    poisson: 2*rho + 0.01*phi__x__x
+    continuity_symmetric: -0.45*c*phi__x__x - 0.55*rho*phi__x__x - 0.45*c__x*phi__x - 0.55*c__x__x + c__y - 0.55*phi__x*rho__x - 0.45*rho__x__x
+    continuity_antisymmetric: -0.55*c*phi__x__x - 0.45*rho*phi__x__x - 0.55*c__x*phi__x - 0.45*c__x__x - 0.45*phi__x*rho__x - 0.55*rho__x__x + rho__y
+    """
+
+    name = "PoissonNernstPlanck"
+
+    def __init__(self, eps=1.0, xi=1.0):
+        # coordinates
+        x = Symbol("x")
+        y = Symbol("y")
+
+        # make input variables
+        input_variables = {"x": x, "y": y}
+
+        # make c, rho, and phi functions
+        c = Function("c")(*input_variables)
+        rho = Function("rho")(*input_variables)
+        phi = Function("phi")(*input_variables)
+
+        # nondimensional constants
+        eps = Number(eps)
+        alpha = Number(0.5 * (1 + xi))
+        beta = Number(0.5 * (1 - xi))
+
+        # set equations
+        self.equations = {}
+        self.equations["poisson"] = eps**2 * phi.diff(x, 2) + 2 * rho
+        self.equations["continuity_symmetric"] = (
+            c.diff(y, 1)
+            - alpha
+            * (c.diff(x, 2) + rho * phi.diff(x, 2) + rho.diff(x, 1) * phi.diff(x, 1))
+            - beta
+            * (rho.diff(x, 2) + c * phi.diff(x, 2) + c.diff(x, 1) * phi.diff(x, 1))
+        )
+        self.equations["continuity_antisymmetric"] = (
+            rho.diff(y, 1)
+            - alpha
+            * (rho.diff(x, 2) + c * phi.diff(x, 2) + c.diff(x, 1) * phi.diff(x, 1))
+            - beta
+            * (c.diff(x, 2) + rho * phi.diff(x, 2) + rho.diff(x, 1) * phi.diff(x, 1))
+        )
+
+
+class BoundaryConditions(PDE):
+    """
+    Boundary conditions for lithium symmetric cell 1D PNP system
+    using the symmetric / antisymmetric transformation
+    Reference:
+    Subramaniam, A., Chen, J., Jang, T., Geise, N. R., Kasse, R. M.,
+    Toney, M. F., & Subramanian, V. R. (2019). Analysis and Simulation
+    of One-Dimensional Transport Models for Lithium Symmetric Cells.
+    Journal of The Electrochemical Society, 166(15), A3806.
+    doi:10.1149/2.0261915jes
+
+    Parameters
+    ==========
+    delta : float, optional
+        Dimensionless cation flux parameter. Defined as
+        I_app * L / (z_p * F * c_0 * D_p)
+        Default is 1.
+
+    Example
+    ========
+    >>> bc = BoundaryConditions(delta=0.1)
+    >>> bc.pprint()
+    neumann_phi_left: phi__xs
+    flux_symmetric_left: -c*phi__x - rho*phi__x - c__x - rho__x - 0.1
+    flux_antisymmetric_left: c*phi__x - rho*phi__x - c__x + rho__x
+    dirichlet_phi_right: phi
+    flux_symmetric_right: -c*phi__x - rho*phi__x - c__x - rho__x - 0.1
+    flux_antisymmetric_right: c*phi__x - rho*phi__x - c__x + rho__x
+    symmetric_initial: c + rho - 1
+    antisymmetric_initial: c - rho - 1
+    """
+
+    name = "BoundaryConditions"
+
+    def __init__(self, delta=1.0):
+        # coordinates
+        x = Symbol("x")
+        y = Symbol("y")
+
+        # make input variables
+        input_variables = {"x": x, "y": y}
+
+        # make cp, cn, and phi functions
+        c = Function("c")(*input_variables)
+        rho = Function("rho")(*input_variables)
+        phi = Function("phi")(*input_variables)
+
+        # nondimensional constants
+        delta = Number(delta)
+
+        self.equations = {}
+
+        # left boundary (x=0)
+        self.equations["neumann_phi_left"] = phi.diff(x, 1)
+        self.equations["flux_symmetric_left"] = (
+            -c.diff(x, 1)
+            - rho.diff(x, 1)
+            - c * phi.diff(x, 1)
+            - rho * phi.diff(x, 1)
+            - delta
+        )
+        self.equations["flux_antisymmetric_left"] = (
+            -c.diff(x, 1) + rho.diff(x, 1) + c * phi.diff(x, 1) - rho * phi.diff(x, 1)
+        )
+
+        # right boundary (x=1)
+        self.equations["dirichlet_phi_right"] = phi
+        self.equations["flux_symmetric_right"] = (
+            -c.diff(x, 1)
+            - rho.diff(x, 1)
+            - c * phi.diff(x, 1)
+            - rho * phi.diff(x, 1)
+            - delta
+        )
+        self.equations["flux_antisymmetric_right"] = (
+            -c.diff(x, 1) + rho.diff(x, 1) + c * phi.diff(x, 1) - rho * phi.diff(x, 1)
+        )
+
+        # initial conditions
+        self.equations["symmetric_initial"] = c + rho - 1
+        self.equations["antisymmetric_initial"] = c - rho - 1
+
+
+class PNPValidatorPlotter(ValidatorPlotter):
+    """
+    Plotter class for validating PNP space-time solutions and spatial profiles
+    using the symmetric / antisymmetric transformation
+
+    Parameters
+    ==========
+    times : Tuple[float], optional
+        Times plot spatial profiles at, by default (0.0, 1.0, 6.0, 36.0, 100.0, 3600.0)
+    t_c : float, optional
+        Characteristic time, by default 1.0
+    """
+
+    def __init__(
+        self,
+        times: Tuple[float] = (0.0, 1.0, 6.0, 36.0, 100.0, 3600.0),
+        t_c: float = 1.0,
+    ):
+        super().__init__()
+        self.t_c = t_c
+        self.times = times
+        self._darken = lambda col: tuple(c * 0.7 for c in col[:3])
+
+        # store colors from color map
+        cmap = colormaps["Dark2"]
+        self._colors = cmap(np.linspace(0, 0.6, len(self.times)))
+        self._darker_colors = [tuple(c * 0.7 for c in col[:3]) for col in self._colors]
+
+        # create cache for interpolated true variables
+        self.true_outvar = None
+
+    def _add_figures(self, group, name, results_dir, writer, step, *args):
+        """Try to make plots and write them to tensorboard summary"""
+
+        # catch exceptions on (possibly user-defined) __call__
+        try:
+            fs = self(*args)
+        except Exception as e:
+            print(f"error: {self}.__call__ raised an exception:", str(e))
+        else:
+            for f, tag in fs:
+                f.savefig(
+                    results_dir + name + "_" + tag + "_" + str(step) + "_epochs.png",
+                    bbox_inches="tight",
+                    pad_inches=0.1,
+                )
+                writer.add_figure(group + "/" + name + "/" + tag, f, step, close=True)
+            plt.close("all")
+
+    def __call__(self, invar, true_outvar, pred_outvar):
+        """
+        Plot true and predicted space-time solutions, their difference,
+        and spatial profiles for each predicted field
+        """
+        # make spatial profiles
+        # create figure
+        fig, axs = plt.subplots(1, 3, figsize=(15, 5), dpi=200)
+
+        axs[0].set_ylabel("cp")
+        axs[1].set_ylabel("cn")
+        axs[2].set_ylabel("phi")
+
+        for ax in axs:
+            ax.set_xlabel("x")
+            ax.set_box_aspect(1)
+
+        x_raw = invar["x"]
+        y_raw = invar["y"]
+
+        # get predictions
+        c_pred_raw = pred_outvar["c"]
+        rho_pred_raw = pred_outvar["rho"]
+        phi_pred_raw = pred_outvar["phi"]
+
+        # compute predicted concentrations
+        pred_outvar["cp"] = c_pred_raw + rho_pred_raw
+        pred_outvar["cn"] = c_pred_raw - rho_pred_raw
+        cp_pred_raw = pred_outvar["cp"]
+        cn_pred_raw = pred_outvar["cn"]
+
+        # get true values
+        c_true_raw = true_outvar["c"]
+        rho_true_raw = true_outvar["rho"]
+        phi_true_raw = true_outvar["phi"]
+
+        # compute true concentrations
+        true_outvar["cp"] = c_true_raw + rho_true_raw
+        true_outvar["cn"] = c_true_raw - rho_true_raw
+        cp_true_raw = c_true_raw + rho_true_raw
+        cn_true_raw = c_true_raw - rho_true_raw
+
+        # group plots by time
+        for i, t in enumerate(self.times):
+            target_y = t / self.t_c
+
+            # find indices where y matches the target time
+            mask = np.isclose(y_raw, target_y, atol=1e-5).flatten()
+
+            if np.any(mask):
+                # get colors
+                col = self._colors[i]
+                col_dark = self._darker_colors[i]
+
+                # sort by x to ensure line plots look correct
+                sort_idx = np.argsort(x_raw[mask].flatten())
+                xs = x_raw[mask][sort_idx]
+
+                # predictions are solid
+                axs[0].plot(
+                    xs,
+                    cp_pred_raw[mask][sort_idx],
+                    label=f"t={t:.1f}s",
+                    color=col,
+                    linestyle="-",
+                    alpha=0.9,
+                )
+                axs[1].plot(
+                    xs,
+                    cn_pred_raw[mask][sort_idx],
+                    label=f"t={t:.1f}s",
+                    color=col,
+                    linestyle="-",
+                    alpha=0.9,
+                )
+                axs[2].plot(
+                    xs,
+                    phi_pred_raw[mask][sort_idx],
+                    label=f"t={t:.1f}s",
+                    color=col,
+                    linestyle="-",
+                    alpha=0.9,
+                )
+
+                # true profiles are dotted
+                axs[0].plot(
+                    xs,
+                    cp_true_raw[mask][sort_idx],
+                    label=f"t={t:.1f}s",
+                    color=col_dark,
+                    linestyle=":",
+                    zorder=3,
+                    alpha=0.9,
+                )
+                axs[1].plot(
+                    xs,
+                    cn_true_raw[mask][sort_idx],
+                    label=f"t={t:.1f}s",
+                    color=col_dark,
+                    linestyle=":",
+                    zorder=3,
+                    alpha=0.9,
+                )
+                axs[2].plot(
+                    xs,
+                    phi_true_raw[mask][sort_idx],
+                    label=f"t={t:.1f}s",
+                    color=col_dark,
+                    linestyle=":",
+                    zorder=3,
+                    alpha=0.9,
+                )
+
+        for ax in axs:
+            ax.legend(framealpha=0.0)
+
+        # add legend for true versus pred
+        dashed_proxy = Line2D([0], [0], color="gray", linestyle=":", label="True")
+        solid_proxy = Line2D([0], [0], color="gray", linestyle="-", label="Prediction")
+        fig.legend(
+            handles=[dashed_proxy, solid_proxy],
+            loc="upper center",
+            ncol=2,
+            framealpha=0.0,
+        )
+
+        plt.tight_layout()
+
+        figures = [(fig, "spatial_profiles")]
+
+        # make space-time validation plots
+        # interpolate
+        if self.true_outvar is None:
+            extent, true_outvar, pred_outvar = self._interpolate_2D(
+                100, invar, true_outvar, pred_outvar
+            )
+            self.true_outvar = true_outvar
+        else:
+            true_outvar = self.true_outvar
+            extent, pred_outvar = self._interpolate_2D(100, invar, pred_outvar)
+
+        # make one validation plot for each field
+        for key in pred_outvar:
+            fig, axs = plt.subplots(1, 3, figsize=(15, 5), dpi=200)
+
+            true_out = true_outvar[key]
+            pred_out = pred_outvar[key]
+            diff_out = true_out - pred_out
+            tags = ["True", "Predicted", "Difference"]
+
+            # make subplots
+            for i, (out, tag) in enumerate(zip([true_out, pred_out, diff_out], tags)):
+                axs[i].set_box_aspect(1)
+                axs[i].set_xlabel("x")
+                axs[i].set_ylabel("tau")
+                axs[i].set_title(f"{tag} {key}")
+                contour = axs[i].imshow(
+                    out.T,
+                    origin="lower",
+                    extent=extent,
+                    aspect="auto",
+                )
+                fig.colorbar(contour)
+
+            plt.tight_layout()
+            figures.append((fig, key))
+
+        return figures
+
+
+@physicsnemo.sym.main(config_path="conf", config_name="config_brdr")
+def run(cfg: PhysicsNeMoConfig) -> None:
+    # instantiate simulation parameters
+    p = Parameters()
+
+    # make a list of nodes for the graph to unroll on
+    pnp = PoissonNernstPlanck(eps=p.eps, xi=p.xi)
+    bc = BoundaryConditions(delta=p.delta)
+    arch_cfg = cfg.arch[next(iter(cfg.arch))]
+    net = instantiate_arch(
+        input_keys=[Key("x"), Key("y")],
+        output_keys=[Key("c"), Key("rho"), Key("phi")],
+        cfg=arch_cfg,
+    )
+    nodes = pnp.make_nodes() + bc.make_nodes() + [net.make_node(name="net")]
+
+    # add constraints to solver
+    # make geometry
+    x, y = Symbol("x"), Symbol("y")
+    y_f = p.t_f / p.t_c  # final dimensionless time
+
+    if cfg.custom.grid_sampling:
+        rec = GridRectangle((0.0, 0.0), (1.0, y_f))
+    else:
+        rec = Rectangle((0.0, 0.0), (1.0, y_f))
+
+    # make pnp domain
+    pnp_domain = Domain()
+
+    quasirandom = cfg.custom.quasirandom
+
+    # initial condition
+    initial = PointwiseBoundaryConstraint(
+        nodes=nodes,
+        geometry=rec,
+        outvar={"symmetric_initial": 0.0, "antisymmetric_initial": 0.0, "phi": 0.0},
+        batch_size=cfg.batch_size.Initial,
+        criteria=Eq(y, 0.0),
+        quasirandom=quasirandom,
+        fixed_dataset=False,
+    )
+    pnp_domain.add_constraint(initial, "initial")
+
+    # left boundary
+    left = PointwiseBoundaryConstraint(
+        nodes=nodes,
+        geometry=rec,
+        outvar={
+            "flux_symmetric_left": 0.0,
+            "flux_antisymmetric_left": 0.0,
+            "neumann_phi_left": 0.0,
+        },
+        batch_size=cfg.batch_size.Left,
+        criteria=Eq(x, 0.0),
+        quasirandom=quasirandom,
+        fixed_dataset=False,
+    )
+    pnp_domain.add_constraint(left, "left")
+
+    # right boundary
+    right = PointwiseBoundaryConstraint(
+        nodes=nodes,
+        geometry=rec,
+        outvar={
+            "flux_symmetric_right": 0.0,
+            "flux_antisymmetric_right": 0.0,
+            "dirichlet_phi_right": 0.0,
+        },
+        batch_size=cfg.batch_size.Right,
+        criteria=Eq(x, 1.0),
+        quasirandom=quasirandom,
+        fixed_dataset=False,
+    )
+    pnp_domain.add_constraint(right, "right")
+
+    # interior
+    lambda_weighting = None
+    if cfg.custom.sdf:
+        lambda_weighting = {
+            "poisson": Symbol("sdf"),
+            "continuity_symmetric": Symbol("sdf"),
+            "continuity_antisymmetric": Symbol("sdf"),
+        }
+    interior = PointwiseInteriorConstraint(
+        nodes=nodes,
+        geometry=rec,
+        outvar={
+            "poisson": 0.0,
+            "continuity_symmetric": 0.0,
+            "continuity_antisymmetric": 0.0,
+        },
+        batch_size=cfg.batch_size.Interior,
+        lambda_weighting=lambda_weighting,
+        quasirandom=quasirandom,
+        fixed_dataset=False,
+    )
+    pnp_domain.add_constraint(interior, "interior")
+
+    # add validator
+    file_path = "fvm/pnp.csv"
+    if os.path.exists(to_absolute_path(file_path)):
+        mapping = {"x": "x", "y": "y", "cp": "cp", "cn": "cn", "phi": "phi"}
+        fvm_var = csv_to_dict(to_absolute_path(file_path), mapping)
+        fvm_invar_numpy = {
+            key: value for key, value in fvm_var.items() if key in ["x", "y"]
+        }
+        fvm_outvar_numpy = {
+            "c": 0.5 * (fvm_var["cp"] + fvm_var["cn"]),  # symmetric transformation
+            "rho": 0.5
+            * (fvm_var["cp"] - fvm_var["cn"]),  # antisymmetric transformation
+            "phi": fvm_var["phi"],
+        }
+        fvm_validator = PointwiseValidator(
+            nodes=nodes,
+            invar=fvm_invar_numpy,
+            true_outvar=fvm_outvar_numpy,
+            batch_size=1024,
+            plotter=PNPValidatorPlotter(t_c=p.t_c),
+        )
+        pnp_domain.add_validator(fvm_validator)
+    else:
+        warnings.warn(
+            f"Directory {file_path} does not exist. Will skip adding validators."
+        )
+
+    # make solver
+    slv = Solver(cfg, pnp_domain)
+
+    # start solver
+    slv.solve()
+
+
+if __name__ == "__main__":
+    register_custom_arch_configs()
+    register_custom_loss_configs()
+
+    run()

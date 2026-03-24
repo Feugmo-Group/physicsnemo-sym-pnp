@@ -1,0 +1,73 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+defaults:
+  - physicsnemo_default
+  - arch:
+      - fully_connected
+  - scheduler: tf_exponential_lr
+  - optimizer: adam
+  - loss: sum
+  - _self_
+arch:
+  fully_connected:
+    layer_size: 512
+    nr_layers: 6
+    activation_fn: silu
+    adaptive_activations: false
+scheduler:
+  decay_rate: 0.92
+  decay_steps: 4000
+optimizer:
+  lr: 3.0e-4
+
+training:
+  max_steps: 100000
+  grad_agg_freq: 4
+  grad_clip_max_norm: 0.5
+  ntk:
+    use_ntk: false
+    save_name: null
+    run_freq: 10
+  rec_results_freq: 2000
+  rec_validation_freq: 1000
+  rec_inference_freq: 2000
+  rec_monitor_freq: 1000
+  rec_constraint_freq: 2000
+  save_network_freq: 1000
+  summary_freq: 1000
+  print_stats_freq: 100
+
+batch_size:
+  Initial: 1600
+  Left: 1600
+  Right: 1600
+  Interior: 16000
+
+hydra:
+  job:
+    chdir: true
+
+cuda_graphs: false
+
+graph:
+  func_arch: true
+  func_arch_allow_partial_hessian: true
+
+custom:
+  grid_sampling: false
+  sdf: false
+  quasirandom: true
