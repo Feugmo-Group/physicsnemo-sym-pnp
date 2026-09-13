@@ -372,7 +372,7 @@ class PNPValidatorPlotter(ValidatorPlotter):
         return figures
 
 
-@physicsnemo.sym.main(config_path="conf", config_name="config_kan")
+@physicsnemo.sym.main(config_path="conf", config_name="config")
 def run(cfg: PhysicsNeMoConfig) -> None:
     # instantiate simulation parameters
     p = Parameters()
