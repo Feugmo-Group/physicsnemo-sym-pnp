@@ -112,8 +112,8 @@ Radau time integration with rtol 1e-6 and atol 1e-8, written to `pnp.csv` as a
 
 ## Citing
 
-Please cite the archived release rather than the repository head, so that the version is
-unambiguous. See the Data Availability statement of the paper for the DOI.
+The paper cites this repository at commit `a8e5034`. Please refer to that commit rather than
+the repository head, so that the version is unambiguous.
 
 ## License
 
